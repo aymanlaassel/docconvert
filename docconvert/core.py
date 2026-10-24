@@ -204,7 +204,7 @@ def convert(src: str | Path, dst: str | Path, *, use_soffice: bool = True) -> Pa
     if dfmt not in WRITERS:
         raise ValueError(f"unsupported output format: .{dfmt} (supported: {', '.join(SUPPORTED)})")
     if not src.is_file():
-        raise FileNotFoundError(src)
+        raise FileNotFoundError(f"file not found: {src}")
     if sfmt == dfmt:
         raise ValueError("input and output formats are the same")
 
