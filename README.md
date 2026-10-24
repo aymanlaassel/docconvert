@@ -12,6 +12,17 @@ pip install .
 
 ## Use
 
+### Point and click
+
+```sh
+docconvert-ui
+```
+
+Opens a page in your browser. Drop a file in, pick the format, and the
+converted file lands in your Downloads.
+
+### Command line
+
 ```sh
 docconvert report.docx -o report.pdf      # explicit output file
 docconvert notes.md --to docx             # same name, new extension
