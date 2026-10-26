@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import argparse
 import sys
+import warnings
 from pathlib import Path
 
-from .core import SUPPORTED, convert
+from .core import SUPPORTED, FidelityWarning, convert
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -30,8 +31,15 @@ def main(argv: list[str] | None = None) -> int:
         src = Path(inp)
         dst = Path(args.output) if args.output else src.with_suffix("." + args.to)
         try:
-            convert(src, dst, use_soffice=not args.no_soffice)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always", FidelityWarning)
+                convert(src, dst, use_soffice=not args.no_soffice)
             print(f"{src} -> {dst}")
+            for w in caught:
+                if issubclass(w.category, FidelityWarning):
+                    print(f"note: {w.message}", file=sys.stderr)
+                else:
+                    warnings.warn_explicit(w.message, w.category, w.filename, w.lineno)
         except Exception as exc:  # noqa: BLE001 - report and continue with next file
             failed += 1
             print(f"error: {src}: {exc}", file=sys.stderr)

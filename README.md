@@ -69,12 +69,14 @@ Give the real path to your file. If the file is in another folder, either
 
 ## What it does and doesn't do
 
-Files are read into a flat list of headings and paragraphs, then written back
-out in the target format. Formatting beyond headings and paragraphs (tables,
-images, fonts, columns) is not preserved.
+Files are read into a flat list of blocks (headings, paragraphs, pictures,
+tables), then written back out in the target format. From `docx`, pictures,
+tables, bold/italic text, paragraph alignment and page size are kept. Fonts,
+columns, headers/footers and exact line breaks are not.
 
 If [LibreOffice](https://www.libreoffice.org/) is installed, `docx -> pdf` goes
-through it for faithful layout. Pass `--no-soffice` to force the pure-Python path.
+through it for an exact rendering. Without it the built-in renderer is used
+and a note is printed; pass `--no-soffice` to force the built-in path silently.
 
 ## Develop
 
