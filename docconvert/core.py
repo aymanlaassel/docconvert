@@ -52,6 +52,7 @@ class Block:
     width: float | None = None  # img: display width in inches
     height: float | None = None  # img: display height in inches
     rows: list[list[str]] | None = None  # table: cell text
+    cell_blocks: list[list[list["Block"]]] | None = None  # table: rich cell content
     page: tuple[float, float] | None = None  # page: (width, height) in inches
     margins: tuple[float, float, float, float] | None = None  # page: left, right, top, bottom
 
@@ -186,27 +187,43 @@ def _para_runs(para) -> list[Run]:
 
 def _docx_paragraph(para, part) -> list[Block]:
     """Text block (with runs) and/or image blocks for one python-docx Paragraph."""
-    blocks: list[Block] = []
     style = (para.style.name or "").lower()
     m = re.match(r"heading (\d)", style)
     kind = f"h{m.group(1)}" if m else ("h1" if style == "title" else "p")
     align = _para_alignment(para)
 
-    runs = _merge_runs(_para_runs(para))
-    text = "".join(r.text for r in runs).strip()
-    if text:
-        # strip only the outer whitespace, keep inner spacing between runs
-        while runs and not runs[0].text.strip():
-            runs.pop(0)
-        while runs and not runs[-1].text.strip():
-            runs.pop()
-        runs[0].text = runs[0].text.lstrip()
-        runs[-1].text = runs[-1].text.rstrip()
-        blocks.append(Block(kind, text, runs=runs, align=align))
+    blocks: list[Block] = []
+    text_runs: list[Run] = []
 
-    for img in _docx_images(para._p, part):
-        img.align = align
-        blocks.append(img)
+    def flush_text() -> None:
+        nonlocal text_runs
+        text_runs = _merge_runs(text_runs)
+        if text_runs and "".join(r.text for r in text_runs).strip():
+            text_runs[0].text = text_runs[0].text.lstrip()
+            text_runs[-1].text = text_runs[-1].text.rstrip()
+            blocks.append(Block(kind, "".join(r.text for r in text_runs), runs=text_runs, align=align))
+        text_runs = []
+
+    # Walk runs and drawings together. This keeps an inline picture between
+    # surrounding text instead of appending every picture after the paragraph.
+    from docx.oxml.ns import qn
+    from docx.text.run import Run as DocxRun
+
+    for element in para._p.iter():
+        if element.tag != qn("w:r"):
+            continue
+        run = DocxRun(element, para)
+        for child in element:
+            if child.tag == qn("w:t"):
+                text_runs.append(Run(child.text or "", bool(run.bold), bool(run.italic)))
+            elif child.tag in (qn("w:tab"), qn("w:br"), qn("w:cr")):
+                text_runs.append(Run("\t" if child.tag == qn("w:tab") else "\n", bool(run.bold), bool(run.italic)))
+            elif child.tag == qn("w:drawing"):
+                flush_text()
+                for img in _docx_images(child, part):
+                    img.align = align
+                    blocks.append(img)
+    flush_text()
     return blocks
 
 
@@ -239,21 +256,24 @@ def read_docx(path: Path) -> list[Block]:
             blocks.extend(_docx_paragraph(Paragraph(child, doc), doc.part))
         elif tag == "tbl":
             rows = []
-            cell_images: list[Block] = []
+            cell_blocks = []
             for row in Table(child, doc).rows:
                 cells = []
+                row_blocks = []
                 prev_tc = None
                 for cell in row.cells:
                     if cell._tc is prev_tc:  # horizontally merged cell, already recorded
                         continue
                     prev_tc = cell._tc
-                    cells.append("\n".join(p.text.strip() for p in cell.paragraphs if p.text.strip()))
+                    content = []
                     for p in cell.paragraphs:
-                        cell_images.extend(_docx_images(p._p, doc.part))
+                        content.extend(_docx_paragraph(p, doc.part))
+                    cells.append("\n".join(b.text.strip() for b in content if b.is_text and b.text.strip()))
+                    row_blocks.append(content)
                 rows.append(cells)
+                cell_blocks.append(row_blocks)
             if rows and any(rows):
-                blocks.append(Block("table", rows=rows))
-            blocks.extend(cell_images)  # pictures inside cells come right after the table
+                blocks.append(Block("table", rows=rows, cell_blocks=cell_blocks))
     return blocks
 
 
@@ -311,6 +331,21 @@ def _md_inline(block: Block) -> str:
 def write_md(blocks: list[Block], path: Path) -> None:
     out = []
     n_img = 0
+
+    def cell_text(cell: list[Block]) -> str:
+        nonlocal n_img
+        parts = []
+        for b in cell:
+            if b.is_text:
+                parts.append(_md_inline(b))
+            elif b.kind == "img" and b.data:
+                n_img += 1
+                ext = _IMG_EXT.get(b.mime or "", "bin")
+                img_path = path.with_name(f"{path.stem}_img{n_img}.{ext}")
+                img_path.write_bytes(b.data)
+                parts.append(f"![image {n_img}]({img_path.name})")
+        return " ".join(parts).replace("\n", " ")
+
     for b in blocks:
         if b.kind.startswith("h"):
             out.append("#" * int(b.kind[1]) + " " + b.text)
@@ -319,6 +354,9 @@ def write_md(blocks: list[Block], path: Path) -> None:
         elif b.kind == "table" and b.rows and max(len(r) for r in b.rows):
             width = max(len(r) for r in b.rows)
             rows = [r + [""] * (width - len(r)) for r in b.rows]
+            if b.cell_blocks:
+                rows = [[cell_text(c) for c in row] for row in b.cell_blocks]
+                rows = [r + [""] * (width - len(r)) for r in rows]
             esc = lambda c: c.replace("\n", " ").replace("|", "\\|")  # noqa: E731
             lines = ["| " + " | ".join(esc(c) for c in rows[0]) + " |", "|" + " --- |" * width]
             lines += ["| " + " | ".join(esc(c) for c in r) + " |" for r in rows[1:]]
@@ -346,14 +384,27 @@ def _html_inline(block: Block) -> str:
 
 def write_html(blocks: list[Block], path: Path) -> None:
     body = []
+
+    def cell_html(cell: list[Block]) -> str:
+        parts = []
+        for b in cell:
+            if b.is_text:
+                parts.append(_html_inline(b))
+            elif b.kind == "img" and b.data:
+                uri = f"data:{b.mime or 'image/png'};base64,{base64.b64encode(b.data).decode('ascii')}"
+                w = f' width="{int(b.width * 96)}"' if b.width else ""
+                parts.append(f'<img src="{uri}"{w} alt="">')
+        return "<br>".join(parts)
+
     for b in blocks:
         style = f' style="text-align:{b.align}"' if b.align else ""
         if b.is_text:
             body.append(f"<{b.kind}{style}>{_html_inline(b)}</{b.kind}>")
         elif b.kind == "table" and b.rows:
+            cell_rows = b.cell_blocks or [[[Block("p", c)] for c in row] for row in b.rows]
             trs = "".join(
-                "<tr>" + "".join(f"<td>{html.escape(c).replace(chr(10), '<br>')}</td>" for c in row) + "</tr>"
-                for row in b.rows
+                "<tr>" + "".join(f"<td>{cell_html(c)}</td>" for c in row) + "</tr>"
+                for row in cell_rows
             )
             body.append(f'<table border="1" cellpadding="4" cellspacing="0">{trs}</table>')
         elif b.kind == "img" and b.data:
@@ -396,7 +447,20 @@ def write_docx(blocks: list[Block], path: Path) -> None:
             table.style = "Table Grid"
             for i, row in enumerate(b.rows):
                 for j, cell in enumerate(row):
-                    table.cell(i, j).text = cell
+                    target = table.cell(i, j)
+                    content = b.cell_blocks[i][j] if b.cell_blocks and i < len(b.cell_blocks) and j < len(b.cell_blocks[i]) else [Block("p", cell)]
+                    target.text = ""
+                    para = target.paragraphs[0]
+                    for item in content:
+                        if item.is_text:
+                            for r in _runs(item):
+                                run = para.add_run(r.text)
+                                run.bold, run.italic = r.bold or None, r.italic or None
+                        elif item.kind == "img" and item.data:
+                            try:
+                                para.add_run().add_picture(io.BytesIO(item.data), width=Inches(item.width) if item.width else None)
+                            except Exception:
+                                _skip_image(item)
         elif b.kind == "img" and b.data:
             try:
                 doc.add_picture(io.BytesIO(b.data), width=Inches(b.width) if b.width else None)
@@ -449,6 +513,24 @@ def write_pdf(blocks: list[Block], path: Path) -> None:
             parts.append(t)
         return "".join(parts)
 
+    def cell_flowables(cell: list[Block], cell_style: ParagraphStyle) -> list:
+        flowables = []
+        for item in cell:
+            if item.is_text:
+                flowables.append(Paragraph(markup(item), cell_style))
+            elif item.kind == "img" and item.data:
+                try:
+                    px_w, px_h = ImageReader(io.BytesIO(item.data)).getSize()
+                    if not px_w or not px_h:
+                        raise ValueError("empty image")
+                    w = item.width * inch if item.width else min(frame_w / 2, px_w * 72 / 96)
+                    h = item.height * inch if (item.height and item.width) else w * px_h / px_w
+                    scale = min(1.0, (frame_w / 2) / w, (frame_h - 12) / h)
+                    flowables.append(Image(io.BytesIO(item.data), width=w * scale, height=h * scale))
+                except Exception:
+                    _skip_image(item)
+        return flowables or [Paragraph("", cell_style)]
+
     story = []
     for b in blocks:
         if b.is_text:
@@ -457,9 +539,10 @@ def write_pdf(blocks: list[Block], path: Path) -> None:
         elif b.kind == "table" and b.rows and max(len(r) for r in b.rows):
             width = max(len(r) for r in b.rows)
             cell_style = ParagraphStyle("cell", parent=styles["BodyText"], fontSize=9, leading=11)
+            cell_rows = b.cell_blocks or [[[Block("p", c)] for c in row] for row in b.rows]
             data = [
-                [Paragraph(html.escape(c).replace("\n", "<br/>"), cell_style) for c in r + [""] * (width - len(r))]
-                for r in b.rows
+                [cell_flowables(c, cell_style) for c in r + [[]] * (width - len(r))]
+                for r in cell_rows
             ]
             t = Table(data, colWidths=[frame_w / width] * width, repeatRows=0)
             t.setStyle(TableStyle([

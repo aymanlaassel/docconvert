@@ -100,6 +100,28 @@ def test_docx_reader_keeps_images_tables_and_runs(rich_docx: Path):
         ("Bold part", True, False), (" and ", False, False), ("italic part", False, True)]
 
 
+def test_inline_picture_stays_between_surrounding_text(tmp_path: Path):
+    import io
+
+    import docx
+    from PIL import Image
+    from docconvert.core import read_docx
+
+    buf = io.BytesIO()
+    Image.new("RGB", (20, 20), "red").save(buf, format="PNG")
+    d = docx.Document()
+    p = d.add_paragraph()
+    p.add_run("before")
+    p.add_run().add_picture(io.BytesIO(buf.getvalue()))
+    p.add_run("after")
+    src = tmp_path / "inline.docx"
+    d.save(str(src))
+
+    blocks = read_docx(src)
+    assert [b.kind for b in blocks[1:]] == ["p", "img", "p"]
+    assert [b.text for b in blocks[1:]] == ["before", "", "after"]
+
+
 def test_docx_to_pdf_fallback_keeps_images_and_tables(tmp_path: Path, rich_docx: Path):
     from pypdf import PdfReader
 
@@ -146,6 +168,31 @@ def test_docx_writer_keeps_image_and_table(tmp_path: Path, rich_docx: Path):
     d = docx.Document(str(out))
     assert any("image" in r.reltype for r in d.part.rels.values())
     assert d.tables and d.tables[0].cell(1, 1).text == "COT 3541"
+
+
+def test_picture_in_table_cell_stays_in_cell(tmp_path: Path):
+    import io
+
+    import docx
+    from PIL import Image
+    from docconvert.core import convert, read_docx
+
+    buf = io.BytesIO()
+    Image.new("RGB", (20, 20), "blue").save(buf, format="PNG")
+    d = docx.Document()
+    cell = d.add_table(rows=1, cols=1).cell(0, 0)
+    cell.paragraphs[0].add_run("caption")
+    cell.add_paragraph().add_run().add_picture(io.BytesIO(buf.getvalue()))
+    src = tmp_path / "cell-image.docx"
+    d.save(str(src))
+
+    blocks = read_docx(src)
+    table = next(b for b in blocks if b.kind == "table")
+    assert table.cell_blocks and any(b.kind == "img" for b in table.cell_blocks[0][0])
+    out = tmp_path / "cell-image.html"
+    convert(src, out)
+    markup = out.read_text()
+    assert "<table" in markup and markup.index("<table") < markup.index("data:image/png;base64,")
 
 
 # ---------------------------------------------------------------- awkward docx input
